@@ -1,129 +1,113 @@
+# physics_sim.py
 import numpy as np
 from scipy.optimize import fsolve
-from config import PUMP_BASE_CURVES, SYSTEM_K_VALUE
-
-# --- 1. 抽水機物理模型 (相似定律) ---
+from config import PUMP_BASE_CURVES
 
 def get_pump_flow(pump_id, frequency, head, degradation_factors):
     """
-    使用相似定律和衰退因子，計算(f, H)下的流量Q。
+    計算單台抽水機在給定頻率(f)和揚程(H)下的流量(Q)。
+    應用了相似定律 (Affinity Laws) 與老化因子。
     """
-    if frequency <= 0:
+    if frequency <= 0.1: # 頻率趨近 0 則視為關機
         return 0.0
-
-    # 取得衰退因子
-    d_H = degradation_factors[f'pump{pump_id}_dH']
-    d_Q = degradation_factors[f'pump{pump_id}_dQ']
     
-    # 1. 讀取原廠 60Hz 數據
+    # 1. 取得該泵的衰退因子 (預設為 1.0 無衰退)
+    #    dH: 揚程衰退 (曲線上下縮放)
+    #    dQ: 流量衰退 (曲線左右縮放)
+    d_H = degradation_factors.get(f'pump{pump_id}_dH', 1.0)
+    d_Q = degradation_factors.get(f'pump{pump_id}_dQ', 1.0)
+    
+    # 2. 讀取原廠 60Hz 曲線
     curve = PUMP_BASE_CURVES[f'pump{pump_id}']
     base_f = curve['freq']
     
-    # 2. 【校準】將原廠數據 "縮水" 到反映老化的狀態
-    #    (注意：我們假設 d_H 和 d_Q 是基於 60Hz 的衰退)
-    base_H_calibrated = curve['head'] * d_H
-    base_Q_calibrated = curve['flow'] * d_Q
+    # 3. 先對原廠曲線進行 "老化縮放"
+    base_H_cal = curve['head'] * d_H
+    base_Q_cal = curve['flow'] * d_Q
     
-    # 3. 【相似定律】將 "校準後" 的基準曲線縮放到 'frequency'
+    # 4. 再進行 "相似定律 (Affinity Laws)" 縮放
+    #    Q_new = Q_base * (f_new / f_base)
+    #    H_new = H_base * (f_new / f_base)^2
     ratio = frequency / base_f
-    ratio_sq = ratio ** 2
+    new_Q_curve = base_Q_cal * ratio
+    new_H_curve = base_H_cal * (ratio ** 2)
     
-    new_Q_curve = base_Q_calibrated * ratio
-    new_H_curve = base_H_calibrated * ratio_sq
+    # 5. 使用內插法 (Interpolation) 查表
+    #    給定現在的揚程 H (head)，反查能打出多少水 Q
     
-    # 4. 【內插法】反向查詢
-    max_head = new_H_curve[0]
-    min_head = new_H_curve[-1]
-    
-    if head >= max_head:
+    # 邊界檢查：如果揚程太高 (超過關死點)，流量為 0
+    if head >= new_H_curve[0]: 
         return 0.0
-    if head <= min_head:
+    # 邊界檢查：如果揚程太低 (低於曲線範圍)，取最大流量
+    if head <= new_H_curve[-1]: 
         return new_Q_curve[-1]
-        
-    # [::-1] 是因為 H 遞減，Q 遞增，內插法需要 x 軸 (H) 遞增
+    
+    # 內插 (注意：np.interp 需要 x 軸遞增，但 H 通常是遞減，所以用 [::-1] 反轉陣列)
     predicted_flow = np.interp(head, new_H_curve[::-1], new_Q_curve[::-1])
     
     return predicted_flow
 
-# --- 2. 功耗模型 ---
-
-def get_pump_power(pump_id, frequency, flow, head):
+def simulate_hour(freqs, static_head, factors, system_k):
     """
-    【您必須提供】您訓練好的 "功耗" 迴歸模型。
-    輸入 (f, Q, H)，輸出 Power (kW)。
-    (單位必須一致！ Q 是 m³/s)
-    """
-    # --- 範例 (請用您的迴歸公式替換) ---
-    if flow <= 0 or frequency <= 0:
-        return 0.0
-        
-    # 這是一個非常簡陋的物理估計 P = (Q * H * g * rho) / efficiency
-    # 您的迴歸模型會更準確
-    # P_kW = (Q_m3s * H_m * 9.81 * 1000) / (0.75 * 1000)
-    # 假設效率 75%
-    if flow > 0:
-        power_kw = (flow * head * 9.81 * 1000) / (0.75 * 1000)
-        return power_kw
-    return 0.0
-    # --- 範例結束 ---
-
-
-# --- 3. 系統模擬器 (fsolve) ---
-
-def get_system_head(total_flow_m3s, static_head):
-    """
-    系統曲線: H = H_static + k * Q^2
-    """
-    return static_head + SYSTEM_K_VALUE * (total_flow_m3s ** 2)
-
-def simulate_hour(frequencies, static_head, degradation_factors):
-    """
-    模擬一小時的工況，找出(H_op, Q_op)和功耗。
+    模擬一小時的系統運作。
+    
+    輸入:
+      freqs: [f1, f2, f3] 三台泵的頻率
+      static_head: 靜揚程 (出水口高程 - 入水口水位)
+      factors: 衰退因子字典
+      system_k: 管損係數
+      
+    輸出:
+      H_op: 平衡點揚程 (m)
+      total_flow: 總流量 (m3/s)
+      total_power: 總功耗 (kW) - 估算值
     """
     
-    # 這是 fsolve 要解的方程
-    def equations_to_solve(head_guess):
-        # head_guess 是一個純量 (e.g., [30.0])
-        H = head_guess[0] 
+    # 定義平衡方程式：供給流量 - 需求流量 = 0
+    def equations(h_guess):
+        H = h_guess[0]
         
-        # 1. 系統需求 (需求曲線)
+        # 1. 系統需求曲線 (System Curve)
+        #    Q_sys = sqrt((H - H_static) / K)
         if H < static_head:
-            system_flow = 0.0
+            q_sys = 0.0
         else:
-            system_flow = np.sqrt((H - static_head) / SYSTEM_K_VALUE)
+            q_sys = np.sqrt((H - static_head) / system_k)
         
-        # 2. 抽水機供給 (供給曲線)
-        pump_flow = 0.0
-        for i in range(4): # 4 台泵
-            pump_id = i + 1
-            f = frequencies[i]
-            pump_flow += get_pump_flow(pump_id, f, H, degradation_factors)
+        # 2. 抽水機供給曲線 (Pump Curve)
+        #    Q_pump = Q1 + Q2 + Q3
+        q_pump = 0.0
+        for i in range(3):
+            q_pump += get_pump_flow(i+1, freqs[i], H, factors)
             
-        # 求解目標： 供給 - 需求 = 0
-        return pump_flow - system_flow
+        return q_pump - q_sys
 
-    # 3. 執行 fsolve 求解器
-    #    (給一個合理的初始猜測值，例如 H_static + 5m)
+    # 使用 fsolve 求解平衡揚程
+    # 初始猜測值設為 靜揚程 + 10m
     try:
-        H_op = fsolve(equations_to_solve, [static_head + 5.0])[0]
-    except Exception as e:
-        # 求解失敗，可能是不合理的工況
-        print(f"求解器失敗: {e} | freqs: {frequencies} | H_static: {static_head}")
-        return 0.0, 0.0 # 回傳 0 功耗 0 流量
-
-    # 4. 找到 H_op，計算該工況下的總流量和總功耗
-    total_flow_op = 0.0
-    total_power_op = 0.0
+        H_op = fsolve(equations, [static_head + 10.0])[0]
+    except:
+        return 0.0, 0.0, 0.0 # 求解失敗
+        
+    # --- 計算結果 ---
+    total_flow = 0.0
+    total_power = 0.0
     
-    for i in range(4):
-        pump_id = i + 1
-        f = frequencies[i]
+    for i in range(3):
+        f = freqs[i]
+        # 再次呼叫函數取得該泵在平衡揚程下的流量
+        q = get_pump_flow(i+1, f, H_op, factors)
+        total_flow += q
         
-        q_op = get_pump_flow(pump_id, f, H_op, degradation_factors)
-        p_op = get_pump_power(pump_id, f, q_op, H_op)
-        
-        total_flow_op += q_op
-        total_power_op += p_op
-        
-    # 回傳 (總功耗 kW, 總流量 m³/s)
-    return total_power_op, total_flow_op
+        # --- 功耗計算 ---
+        # 這裡使用簡易物理公式 P = (rho * g * Q * H) / efficiency
+        # 如果您有每台泵的 "功率迴歸公式"，請在這裡替換！
+        if q > 0:
+            # 假設綜合效率 (馬達+泵) 為 60% (0.6)
+            # 1 kW = 1000 W
+            # P (kW) = (Q(m3/s) * H(m) * 9810) / (0.6 * 1000)
+            efficiency = 0.6 
+            p = (q * H_op * 9.81) / efficiency
+            total_power += p
+            
+    return H_op, total_flow, total_power

@@ -1,143 +1,126 @@
+# optimize.py
 import numpy as np
 from scipy.optimize import differential_evolution
 import json
-import sys
-
-# 導入我們的模組
-from config import (
-    CALIBRATION_FILE_PATH, OPTIMIZATION_BOUNDS, 
-    get_tou_price, N_VARIABLES
-)
+from config import MIN_ON_FREQUENCY, PUMP_BOUNDS, get_tou_price
 from physics_sim import simulate_hour
-from forecast_models import get_predicted_static_head, get_target_daily_volume
 
-# --- 全局變數 (儲存校準因子和預測) ---
-CALIBRATED_FACTORS = None
-HOURLY_STATIC_HEAD = []
-TARGET_VOLUME = 0.0
+# --- 1. 載入校準參數 ---
+try:
+    with open('data/calibration_results.json') as f:
+        CALIB = json.load(f)
+    print("成功載入校準參數。")
+except FileNotFoundError:
+    print("錯誤：找不到校準參數。請先執行 calibrate.py")
+    exit()
 
+L_OUT = CALIB['L_out_const']
+K_VAL = CALIB['system_k']
+
+# --- 2. 設定目標與預測 ---
+# 假設：明日需求量 130,000 CMD
+# TODO: 這裡填入當月每日抽水需求量
+TARGET_CMD = 130000.0 
+TARGET_CMS_TOTAL = TARGET_CMD # 累積量比較時再轉秒或直接比對體積
+
+# 假設：明日入水口水位預測 (簡化為固定 6.0m，實際應為 24 小時陣列)
+# TODO: 製作不同月份水圳的高低預設值
+def get_predicted_inlet(h):
+    return 6.0 
+
+# --- 3. 定義 DE 的目標函數 ---
 def objective_function(solution_vector):
     """
-    DE 演算法的目標函數。
+    DE 演算法會不斷呼叫此函數，傳入一組 72 維的向量 (24小時*3泵)。
+    我們需回傳這組解的 "總成本" (越低越好)。
     """
-    global CALIBRATED_FACTORS, HOURLY_STATIC_HEAD, TARGET_VOLUME
-    
-    # 1. 將 96 維向量拆解
-    hourly_frequencies = np.reshape(solution_vector, (24, 4))
+    # 將一維向量 (72,) 重塑為 (24, 3)
+    freq_matrix = solution_vector.reshape((24, 3))
     
     total_cost = 0.0
-    total_volume_m3 = 0.0
+    total_flow_accumulated = 0.0 # 累積總抽水量 (m3)
     
-    # 2. 模擬 24 小時
-    for hour in range(24):
-        frequencies_this_hour = hourly_frequencies[hour]
-        static_head = HOURLY_STATIC_HEAD[hour]
+    for h in range(24):
+        raw_freqs = freq_matrix[h]
         
-        # 執行模擬 (使用已校準的因子)
-        power_kw, flow_m3s = simulate_hour(
-            frequencies_this_hour,
-            static_head,
-            CALIBRATED_FACTORS
-        )
+        # --- 關鍵邏輯：起停限制 (30-60Hz) ---
+        real_freqs = []
+        for f in raw_freqs:
+            if f < MIN_ON_FREQUENCY:
+                real_freqs.append(0.0) # 強制關機
+            else:
+                real_freqs.append(f)   # 保持原設定
         
-        # 3. 累加成本 (目標)
-        price = get_tou_price(hour)
-        total_cost += power_kw * price # (kW * 1h * $/kWh)
+        # 取得該小時預測水位
+        inlet = get_predicted_inlet(h)
+        # 計算靜揚程
+        H_stat = L_OUT - inlet
         
-        # 4. 累加流量 (約束)
-        total_volume_m3 += flow_m3s * 3600 # (m³/s * 3600 s/h)
-
-    # 5. 計算懲罰
-    total_penalty = 0.0
-    if total_volume_m3 < TARGET_VOLUME:
-        deficit = TARGET_VOLUME - total_volume_m3
-        # 懲罰 = (缺少的體積 m³ * 一個大數字)
-        total_penalty = deficit * 1000 
+        # 執行物理模擬
+        _, q_cms, p_kw = simulate_hour(real_freqs, H_stat, CALIB, K_VAL)
         
-    # DE 的目標是最小化 (成本 + 懲罰)
-    return total_cost + total_penalty
-
-def load_calibration_data():
-    """
-    載入校準檔案
-    """
-    try:
-        with open(CALIBRATION_FILE_PATH, 'r') as f:
-            factors = json.load(f)
-        print(f"成功載入校準檔案: {CALIBRATION_FILE_PATH}")
-        return factors
-    except FileNotFoundError:
-        print(f"錯誤: 找不到校準檔案 {CALIBRATION_FILE_PATH}")
-        print("請先執行 'python calibrate.py' 產生此檔案。")
-        sys.exit(1) # 終止程式
-
-def run_de_optimization():
-    """
-    執行差分進化演算法
-    """
-    print("開始執行差分進化 (DE) 最佳化...")
-    print(f"求解 {N_VARIABLES} 個變數 (24 小時 * 4 台泵)...")
-    
-    result = differential_evolution(
-        func=objective_function,
-        bounds=OPTIMIZATION_BOUNDS,
-        strategy='best1bin',
-        maxiter=1000,       # (可增加迭代次數以獲得更好結果)
-        popsize=20,         # (可增加族群大小)
-        tol=0.01,
-        recombination=0.7,
-        mutation=(0.5, 1),
-        workers=-1,         # 使用所有 CPU 核心並行計算
-        disp=True           # 顯示進度
-    )
-    
-    return result
+        # 累加成本 (kW * 1hr * 電價)
+        total_cost += p_kw * get_tou_price(h)
+        
+        # 累加流量 (m3/s * 3600s = m3)
+        total_flow_accumulated += q_cms * 3600
+        
+    # --- 懲罰函數 (Penalty) ---
+    # 如果總抽水量未達標，給予巨額罰款
+    penalty = 0.0
+    if total_flow_accumulated < TARGET_CMD:
+        diff = TARGET_CMD - total_flow_accumulated
+        penalty = diff * 1000 # 罰款係數 (可調整)
+        
+    return total_cost + penalty
 
 if __name__ == "__main__":
-    # --- 步驟 1: 載入校準因子 ---
-    CALIBRATED_FACTORS = load_calibration_data()
+    print(f"開始最佳化... 目標流量: {TARGET_CMD} CMD")
+    print("正在執行差分進化演算法 (DE)...")
     
-    # --- 步驟 2: 取得未來 24 小時的預測 ---
-    # (我們在 DE 執行前先算好，避免在目標函數中重複計算)
-    print("正在取得未來 24 小時的預測...")
-    HOURLY_STATIC_HEAD = [get_predicted_static_head(h) for h in range(24)]
-    TARGET_VOLUME = get_target_daily_volume()
-    print(f"每日目標抽水量: {TARGET_VOLUME:.2f} m³")
-
-    # --- 步驟 3: 執行 DE 演算法 ---
-    de_result = run_de_optimization()
+    # 設定變數範圍 (24小時 * 3泵)
+    bounds = PUMP_BOUNDS * 24
     
-    # --- 步驟 4: 顯示結果 ---
-    if de_result.success:
-        print("\n--- 最佳化成功! ---")
-        best_schedule_vector = de_result.x
-        best_cost_and_penalty = de_result.fun
+    # 執行 DE
+    # popsize: 族群大小 (越大越準但越慢)
+    # maxiter: 迭代次數
+    # workers: -1 代表用盡所有 CPU 核心加速
+    res = differential_evolution(
+        objective_function, 
+        bounds, 
+        strategy='best1bin', 
+        maxiter=100, 
+        popsize=15, 
+        workers=-1,
+        disp=True
+    )
+    
+    print("\n--- 最佳化結果 ---")
+    print(f"最低成本 (含懲罰): {res.fun:.2f}")
+    
+    # 解析最佳解
+    best_schedule = res.x.reshape((24, 3))
+    
+    # 重新跑一次模擬以顯示詳細數據
+    print("\n時段 | 泵1(Hz) | 泵2(Hz) | 泵3(Hz) | 流量(CMD) | 功耗(kW) | 電價")
+    total_vol = 0
+    total_bill = 0
+    
+    for h in range(24):
+        raw_f = best_schedule[h]
+        real_f = [f if f >= MIN_ON_FREQUENCY else 0.0 for f in raw_f]
         
-        # 重新計算一次最佳解的詳細資訊
-        best_schedule = np.reshape(best_schedule_vector, (24, 4))
+        inlet = get_predicted_inlet(h)
+        H_stat = L_OUT - inlet
+        _, q_cms, p_kw = simulate_hour(real_f, H_stat, CALIB, K_VAL)
         
-        print(f"最低總成本 (含懲罰): {best_cost_and_penalty:.2f}")
+        vol_cmd = q_cms * 3600
+        cost = p_kw * get_tou_price(h)
         
-        print("\n最佳化排程 (小時, 泵1, 泵2, 泵3, 泵4):")
-        total_vol = 0
-        total_c = 0
-        for h in range(24):
-            f_h = best_schedule[h]
-            h_stat = HOURLY_STATIC_HEAD[h]
-            p, q = simulate_hour(f_h, h_stat, CALIBRATED_FACTORS)
-            vol = q * 3600
-            cost = p * get_tou_price(h)
-            
-            total_vol += vol
-            total_c += cost
-            
-            freq_str = [f"{f:.1f}" for f in f_h]
-            print(f"H{h:02d}: {freq_str} | 靜揚程:{h_stat:.2f}m | 流量:{q*3600:.1f} m³ | 成本:{cost:.2f}")
-
-        print("\n--- 最終模擬結果 ---")
-        print(f"總抽水量: {total_vol:.2f} m³ (目標: {TARGET_VOLUME:.2f} m³)")
-        print(f"總電費: {total_c:.2f}")
-
-    else:
-        print("\n--- 最佳化失敗 ---")
-        print(de_result.message)
+        total_vol += vol_cmd
+        total_bill += cost
+        
+        print(f"{h:02d}   | {real_f[0]:5.1f} | {real_f[1]:5.1f} | {real_f[2]:5.1f} | {vol_cmd:8.1f} | {p_kw:6.1f} | {cost:5.1f}")
+        
+    print(f"\n全日總抽水量: {total_vol:.1f} CMD (目標: {TARGET_CMD})")
+    print(f"預估總電費: {total_bill:.1f} 元")

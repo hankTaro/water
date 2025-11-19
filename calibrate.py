@@ -1,118 +1,94 @@
+# calibrate.py
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 import json
-from physics_sim import simulate_hour # 導入我們的模擬器
-from config import HISTORICAL_DATA_PATH, CALIBRATION_FILE_PATH
+from physics_sim import simulate_hour
+from config import PROCESSED_DATA_PATH, CALIBRATION_FILE_PATH
 
-def load_historical_data():
+def calibration_loss(x, df):
     """
-    載入並清理歷史數據
+    誤差函數：計算「模擬結果」與「歷史數據」的差距。
+    Minimize 會不斷調整 x 來讓這個回傳值變小。
     """
-    try:
-        df = pd.read_csv(HISTORICAL_DATA_PATH)
-    except FileNotFoundError:
-        print(f"錯誤: 找不到歷史數據檔案 {HISTORICAL_DATA_PATH}")
-        print("請先建立此檔案。")
-        return None
+    # 解析未知數向量 x
+    L_out = x[0]      # 未知數 1: 固定的出水口高程
+    k = x[1]          # 未知數 2: 系統管損係數
     
-    # 【您必須確保】CSV 檔案的欄位名稱正確
-    required_cols = ['f1', 'f2', 'f3', 'f4', 'H_static', 'H_total_measured', 'Q_total_measured'] # H_total_measured 如果壓力錶單位是 kg/cm²： H_total_measured (m) = 壓力錶讀數 * 10 (例如：讀數 3.1 kg/cm² 應記錄為 31.0 m)
-    if not all(col in df.columns for col in required_cols):
-        print(f"錯誤: CSV 檔案缺少必要欄位。需要: {required_cols}")
-        return None
-        
-    return df
-
-def calibration_error_function(factors_array):
-    """
-    最佳化演算法 (minimize) 會呼叫的誤差函數。
-    """
-    # 1. 將陣列轉換回易於讀取的字典
-    #    (假設 4 台泵，每台 2 個因子 dH, dQ)
-    factors_dict = {
-        'pump1_dH': factors_array[0], 'pump1_dQ': factors_array[1],
-        'pump2_dH': factors_array[2], 'pump2_dQ': factors_array[3],
-        'pump3_dH': factors_array[4], 'pump3_dQ': factors_array[5],
-        'pump4_dH': factors_array[6], 'pump4_dQ': factors_array[7],
+    # 封裝衰退因子
+    factors = {
+        'pump1_dH': x[2], 'pump1_dQ': x[3],
+        'pump2_dH': x[4], 'pump2_dQ': x[5],
+        'pump3_dH': x[6], 'pump3_dQ': x[7]
     }
     
-    global historical_df # 重複使用已載入的數據
     total_error = 0.0
     
-    # 2. 迭代所有歷史數據點
-    for _, row in historical_df.iterrows():
+    # 為了加速校準，我們不跑全部數據，隨機抽樣 100 筆
+    sample_df = df.sample(n=min(len(df), 100), random_state=42)
+    
+    for _, row in sample_df.iterrows():
+        freqs = [row['f1'], row['f2'], row['f3']]
+        inlet = row['Inlet_Level']
         
-        frequencies = [row['f1'], row['f2'], row['f3'], row['f4']]
-        static_head = row['H_static']
+        # 1. 計算當下的靜揚程 (未知 L_out - 已知 Inlet)
+        H_stat = L_out - inlet
         
-        # 3. 使用 "當前猜測的衰退因子" 執行模擬
-        sim_power, sim_flow = simulate_hour(frequencies, static_head, factors_dict)
+        # 2. 跑模擬
+        H_sim, Q_sim, _ = simulate_hour(freqs, H_stat, factors, k)
         
-        # 4. 根據模擬流量 Q_sim，計算模擬揚程 H_sim
-        #    (我們必須同時比較 Q 和 H 的誤差)
-        from physics_sim import get_system_head
-        sim_head = get_system_head(sim_flow, static_head)
+        # 3. 計算誤差
+        #    這裡我們專注於讓 "模擬總流量" 逼近 "真實總流量 (CMS)"
+        Q_real = row['Q_total_m3s']
         
-        # 5. 取得真實測量值
-        real_head = row['H_total_measured']
-        real_flow = row['Q_total_measured']
-        
-        # 6. 計算誤差 (正規化平方和誤差)
-        #    (避免 Q 和 H 的單位尺度差異過大)
-        if real_head > 1.0: # 避免除以 0
-            err_H = ((sim_head - real_head) / real_head) ** 2
-        else:
-            err_H = (sim_head - real_head) ** 2
+        if Q_real > 0:
+            # 使用相對誤差平方 ((Sim - Real) / Real)^2
+            err_Q = ((Q_sim - Q_real) / Q_real) ** 2
+            total_error += err_Q
 
-        if real_flow > 0.01: # 避免除以 0
-            err_Q = ((sim_flow - real_flow) / real_flow) ** 2
-        else:
-            err_Q = (sim_flow - real_flow) ** 2
-            
-        total_error += err_H + err_Q # 我們同時關心 H 和 Q 的準確性
-        
-    print(f"測試中... 誤差: {total_error:.4f}") # 顯示進度
     return total_error
 
 if __name__ == "__main__":
-    print("開始校準程序...")
+    print("開始系統校準...")
+    try:
+        df = pd.read_csv(PROCESSED_DATA_PATH)
+    except FileNotFoundError:
+        print("錯誤：找不到資料。請先執行 process_data.py")
+        exit()
     
-    historical_df = load_historical_data()
+    # --- 設定初始猜測值 (Initial Guess) ---
+    # [L_out, k,  p1_dH, p1_dQ, p2_dH, p2_dQ, p3_dH, p3_dQ]
+    # 假設出水口海拔約 20m, K值約 50, 衰退因子皆為 1.0
+    x0 = [20.0, 50.0,  1.0, 1.0,  1.0, 1.0,  1.0, 1.0]
     
-    if historical_df is not None:
-        # 初始猜測：8 個變數 (d_H1, d_Q1, d_H2, d_Q2 ...)，全部為 1.0 (無衰退)
-        initial_guess = [1.0] * 8
-        
-        # 邊界：衰退因子應介於 0.8 (衰退20%) 到 1.0 (無衰退) 之間
-        bounds = [(0.8, 1.0)] * 8
-        
-        print("執行最佳化 (minimize) 以尋找衰退因子... 這可能需要幾分鐘...")
-        
-        result = minimize(
-            fun=calibration_error_function,
-            x0=initial_guess,
-            method='L-BFGS-B', # 適合有邊界的最佳化
-            bounds=bounds,
-            options={'disp': True, 'ftol': 1e-6}
-        )
-        
-        if result.success:
-            print("校準成功！")
-            best_factors_array = result.x
-            best_factors_dict = {
-                'pump1_dH': best_factors_array[0], 'pump1_dQ': best_factors_array[1],
-                'pump2_dH': best_factors_array[2], 'pump2_dQ': best_factors_array[3],
-                'pump3_dH': best_factors_array[4], 'pump3_dQ': best_factors_array[5],
-                'pump4_dH': best_factors_array[6], 'pump4_dQ': best_factors_array[7],
-            }
-            print(f"找到的最佳衰退因子: {best_factors_dict}")
-            
-            # 將結果儲存為 JSON
-            with open(CALIBRATION_FILE_PATH, 'w') as f:
-                json.dump(best_factors_dict, f, indent=4)
-            print(f"校準結果已儲存至 {CALIBRATION_FILE_PATH}")
-            
-        else:
-            print("校準失敗。")
-            print(result.message)
+    # --- 設定變數範圍 (Bounds) ---
+    bnds = [
+        (5.0, 100.0),   # L_out: 5m ~ 100m
+        (1.0, 500.0),   # k: 1 ~ 500 (範圍設寬一點)
+        (0.7, 1.1), (0.7, 1.1), # Pump 1 衰退因子 (0.7代表衰退30%)
+        (0.7, 1.1), (0.7, 1.1), # Pump 2
+        (0.7, 1.1), (0.7, 1.1)  # Pump 3
+    ]
+    
+    print("正在最佳化參數 (這可能需要幾分鐘)...")
+    # 使用 L-BFGS-B 演算法進行數值最佳化
+    res = minimize(calibration_loss, x0, args=(df,), bounds=bnds, method='L-BFGS-B')
+    
+    print("\n校準完成!")
+    print(f"成功狀態: {res.success}")
+    print(f"訊息: {res.message}")
+    print(f"最佳參數: {res.x}")
+    
+    # --- 儲存結果 ---
+    result_dict = {
+        'L_out_const': res.x[0],
+        'system_k': res.x[1],
+        'pump1_dH': res.x[2], 'pump1_dQ': res.x[3],
+        'pump2_dH': res.x[4], 'pump2_dQ': res.x[5],
+        'pump3_dH': res.x[6], 'pump3_dQ': res.x[7]
+    }
+    
+    import json
+    with open(CALIBRATION_FILE_PATH, 'w') as f:
+        json.dump(result_dict, f, indent=4)
+    print(f"校準參數已儲存至 {CALIBRATION_FILE_PATH}")

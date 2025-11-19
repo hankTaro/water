@@ -1,69 +1,55 @@
+# config.py
 import numpy as np
 
-# --- 1. 檔案路徑 ---
-CALIBRATION_FILE_PATH = 'data/calibration_results.json'
-HISTORICAL_DATA_PATH = 'data/historical_data.csv'
+# --- 檔案路徑設定 ---
+RAW_DATA_PATH = 'data/202505detail 更改.csv'     # 原始報表
+PROCESSED_DATA_PATH = 'data/historical_data.csv' # 處理後的標準數據
+CALIBRATION_FILE_PATH = 'data/calibration_results.json' # 校準結果
 
+# --- 系統運轉限制 ---
+# 最低開機頻率 (Hz)。
+# 邏輯：演算法如果選出 0 < f < 30，我們強制視為 0 (停機)。
+MIN_ON_FREQUENCY = 30.0 
 
-# --- 2. 系統物理參數 ---
-# 【您必須提供】系統管損係數 k (H = H_static + k * Q^2)
-# (注意 Q 的單位！假設 k 是基於 Q (m³/s) 計算的)
-SYSTEM_K_VALUE = 28.7 # (請替換成您計算出的 k 值)
+# 抽水機運轉邊界 (Min, Max)
+# 我們設定 0~60，讓演算法有機會選擇 "0" (停機)
+PUMP_BOUNDS = [
+    (0, 60), # 1號泵
+    (0, 60), # 2號泵
+    (0, 60), # 3號泵
+]
 
-
-# --- 3. 抽水機原廠數據 (Pump Base Curves) ---
-# 【您必須提供】您那 8 個 H-Q 點 (或更多)
-# 這是 60Hz 基準
+# --- 抽水機原廠特性曲線 (60Hz 基準) ---
+# 【重要】請依照您手冊上的 8 個點填寫
 PUMP_BASE_CURVES = {
     'pump1': {
         'freq': 60.0,
-        'flow': np.array([0, 35775/24, 70590/24, 84360/24, 100433/24, 114599/24, 125432/24, 126821/24]), # m³/hr
-        'head': np.array([19.96, 17.27, 15.06, 13.09, 11.06, 9.17, 7.2, 4.82])    # m
+        # 原廠流量點 (單位 CMD 需轉為 CMS，或直接填 CMS)
+        # 這裡假設您填入的是 m3/hr，除以 3600 轉為 m3/s
+        'flow': np.array([0, 35775/24, 70590/24, 84360/24, 100433/24, 114599/24, 125432/24, 126821/24]) / 3600, 
+        'head': np.array([19.96, 17.27, 15.06, 13.09, 11.06, 9.17, 7.2, 4.82])   # 對應揚程 (m)
     },
-    'pump2': {
+    'pump2': { 
+        # 假設 2 號泵與 1 號泵相同
         'freq': 60.0,
-        'flow': np.array([0, 50, 100, 150, 200, 250, 300, 350]), # m³/hr
-        'head': np.array([71, 69, 66, 61, 53, 41, 26, 11])    # m (假設 2 號泵稍強)
+        'flow': np.array([0, 18927/24, 32534/24, 46720/24, 53082/24, 58539/24, 67008/24, 372269/24]) / 3600,
+        'head': np.array([15.39, 13.5, 12.91, 11.07, 10.39, 9.11, 6.26, 3.56])
     },
-    'pump3': {
+    'pump3': { 
+        # 假設 3 號泵較小
         'freq': 60.0,
-        'flow': np.array([0, 25, 50, 75, 100, 125]),           # m³/hr (假設 3 號是小泵)
-        'head': np.array([50, 48, 42, 35, 25, 15])            # m
-    },
-    'pump4': {
-        'freq': 60.0,
-        'flow': np.array([0, 25, 50, 75, 100, 125]),           # m³/hr (假設 4 號是小泵)
-        'head': np.array([50, 48, 42, 35, 25, 15])            # m
+        'flow': np.array([0, 19728/24, 32702/24, 46290/24, 52482/24, 59476/24, 66191/24, 72944/24]) / 3600,
+        'head': np.array([15.21, 13.49, 12.71, 11.16, 9.99, 9.00, 5.95, 3.57])
     }
 }
 
-# 將 m³/hr 轉換為 m³/s
-for p_id in PUMP_BASE_CURVES:
-    PUMP_BASE_CURVES[p_id]['flow'] /= 3600.0 # 轉換為 m³/s
-
-
-# --- 4. 電價與最佳化設定 ---
+# --- 時段電價設定 (元/度) ---
 def get_tou_price(hour):
     """
-    【您必須提供】根據小時 (0-23) 回傳電價
+    輸入小時 (0-23)，回傳該時段電價
     """
+    # 範例：早上 7 點到晚上 10 點是尖峰
     if 7 <= hour < 22:
-        return 5.0  # 尖峰電價
+        return 5.0 # 尖峰電價
     else:
-        return 2.0  # 離峰電價
-
-# 最佳化邊界 (4 台泵，每台的最小/最大頻率)
-PUMP_BOUNDS = [
-    (30, 60), # 泵 1
-    (30, 60), # 泵 2
-    (0, 60),  # 泵 3 (0=可關閉)
-    (0, 60)   # 泵 4 (0=可關閉)
-]
-
-# 總變數數量 (24 小時 * 4 台泵)
-N_VARIABLES = 24 * len(PUMP_BOUNDS)
-
-# 建立 96 維的 DE 邊界
-OPTIMIZATION_BOUNDS = []
-for _ in range(24):
-    OPTIMIZATION_BOUNDS.extend(PUMP_BOUNDS)
+        return 2.0 # 離峰電價
